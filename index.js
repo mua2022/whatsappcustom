@@ -11,269 +11,126 @@ import { JSONFile } from "lowdb/node";
 
 const { Client, LocalAuth } = pkg;
 
-/* ────────────────────────────────
-   ⚙️ SERVER & SOCKET.IO CONFIG
-──────────────────────────────── */
+/* ── CONFIG & INIT ── */
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: ["https://whatsappweb.marulahomedecor.net"],
-    credentials: true,
-  },
+  cors: { origin: "*", credentials: true }
 });
 
-// Global Middleware
-app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE"] }));
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(cors());
+app.use(express.json({ limit: "5mb" })); // Reduced limit for better performance
 
-
-/* ────────────────────────────────
-   🗃️ DATABASE (LowDB)
-──────────────────────────────── */
-const DB_FILE = "db.json";
-const DEFAULT_DATA = { sessions: [], messages: [], scheduledMessages: [] };
-
-function initDatabase() {
-  try {
-    if (!fs.existsSync(DB_FILE)) {
-      console.log("[INFO] Creating new DB file...");
-      fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DATA, null, 2));
-    } else {
-      const content = fs.readFileSync(DB_FILE, "utf8").trim();
-      try {
-        if (!content) throw new Error("Empty");
-        JSON.parse(content);
-      } catch {
-        console.warn("[WARN] Corrupted or empty DB. Reinitializing...");
-        fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DATA, null, 2));
-      }
-    }
-  } catch (err) {
-    console.error("[FATAL] Database initialization failed:", err);
-    process.exit(1);
-  }
-}
-
-initDatabase();
-
-const adapter = new JSONFile(DB_FILE);
-const db = new Low(adapter, DEFAULT_DATA);
+const adapter = new JSONFile("db.json");
+const db = new Low(adapter, { sessions: [], messages: [], scheduledMessages: [] });
 await db.read();
-await db.write();
 
-console.log("[INFO] Database loaded successfully.");
-
-
-/* ────────────────────────────────
-   🤖 WHATSAPP CLIENT SETUP
-──────────────────────────────── */
-let chatCache = [];
-let currentQrCode = null;
+/* ── WHATSAPP SETUP ── */
+let chatCache = new Map(); // Using a Map for O(1) lookups instead of Array.find
 let isClientReady = false;
 
 const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: "whatsapp-scheduler",
-    dataPath: "/opt/render/project/src/.wwebjs_auth",
-  }),
+  authStrategy: new LocalAuth({ clientId: "whatsapp-scheduler" }),
   puppeteer: {
     headless: true,
-    ignoreDefaultArgs: ["--enable-automation"],
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--no-zygote",
-      "--disable-gpu",
-    ],
-  },
-  webVersionCache: {
-    type: "remote",
-    remotePath:
-      "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
-  },
-});
-
-
-/* ────────────────────────────────
-   🔔 CLIENT EVENT HANDLERS
-──────────────────────────────── */
-client.on("qr", async (qr) => {
-  console.log("🔐 QR Code generated");
-  try {
-    const qrImage = await qrcode.toDataURL(qr);
-    currentQrCode = qrImage;
-    io.emit("qr", { qrImage });
-    io.emit("status", { message: "📱 Scan the QR code", type: "info" });
-  } catch (err) {
-    console.error("QR Error:", err);
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
   }
 });
 
-client.on("authenticated", () => {
-  console.log("🔑 Authenticated successfully");
-  io.emit("status", { message: "Authenticated", type: "success" });
+/* ── HELPER: UPDATE CACHE & EMIT ── */
+const updateChatInCache = async (chatId) => {
+  try {
+    const chat = await client.getChatById(chatId);
+    const simplifiedChat = {
+      id: chat.id._serialized,
+      name: chat.name,
+      unreadCount: chat.unreadCount,
+      timestamp: chat.timestamp
+    };
+    chatCache.set(chatId, simplifiedChat);
+    io.emit("chat_update", Array.from(chatCache.values()));
+  } catch (e) {
+    console.error("Cache update failed", e);
+  }
+};
+
+/* ── CLIENT EVENTS ── */
+client.on("qr", async (qr) => {
+  const qrImage = await qrcode.toDataURL(qr);
+  io.emit("qr", { qrImage });
 });
 
 client.on("ready", async () => {
-  console.log("✅ WhatsApp client ready!");
   isClientReady = true;
-  currentQrCode = null;
-
+  console.log("🚀 Client Ready");
+  
+  // Initial Load (Only once)
   const chats = await client.getChats();
-  chatCache = chats
-    .filter((c) => c.id.server !== "broadcast" && c.id.server !== "status")
-    .slice(0, 100)
-    .map((c) => ({
+  chats.slice(0, 50).forEach(c => {
+    chatCache.set(c.id._serialized, {
       id: c.id._serialized,
-      name: c.name || c.id.user,
-      isGroup: c.isGroup,
-      unreadCount: c.unreadCount || 0,
-    }));
-
-  console.log(`💬 Cached ${chatCache.length} chats.`);
-  io.emit("ready", { message: "✅ WhatsApp is ready!" });
-});
-
-client.on("auth_failure", (msg) => {
-  console.error("❌ Auth failure:", msg);
-  isClientReady = false;
-  io.emit("status", {
-    message: "Auth failed. Rescan QR.",
-    type: "error",
+      name: c.name,
+      unreadCount: c.unreadCount
+    });
   });
+  io.emit("ready", { chats: Array.from(chatCache.values()) });
 });
 
-client.on("disconnected", (reason) => {
-  console.log("⚠️ Disconnected:", reason);
-  isClientReady = false;
-  io.emit("status", { message: "Reconnecting...", type: "warning" });
-  setTimeout(() => client.initialize(), 4000);
+// Update UI instantly on new message instead of polling
+client.on("message", async (msg) => {
+  await updateChatInCache(msg.from);
+  io.emit("new_message", { chatId: msg.from, content: msg.body, fromMe: false });
 });
 
 client.initialize();
 
-
-/* ────────────────────────────────
-   🔄 CHAT CACHE REFRESH (5 min)
-──────────────────────────────── */
-setInterval(async () => {
-  if (!isClientReady) return;
-  try {
-    const chats = await client.getChats();
-    chatCache = chats
-      .filter((c) => c.id.server !== "broadcast" && c.id.server !== "status")
-      .slice(0, 100)
-      .map((c) => ({
-        id: c.id._serialized,
-        name: c.name || c.id.user,
-        isGroup: c.isGroup,
-        unreadCount: c.unreadCount || 0,
-      }));
-    console.log("🔄 Chat cache refreshed.");
-  } catch (err) {
-    console.error("Chat refresh failed:", err.message);
-  }
-}, 1000 * 60 * 5);
-
-
-/* ────────────────────────────────
-   📡 API ROUTES
-──────────────────────────────── */
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: isClientReady ? "connected" : "disconnected",
-    hasQr: !!currentQrCode,
-    timestamp: new Date().toISOString(),
-  });
-});
-
+/* ── OPTIMIZED API ROUTES ── */
 app.get("/api/chats", (req, res) => {
-  if (!isClientReady)
-    return res.status(503).json({ error: "WhatsApp not ready" });
-  res.json({ chats: chatCache });
+  res.json({ chats: Array.from(chatCache.values()) });
 });
 
-app.post("/api/chats/:chatId/messages", async (req, res) => {
-  if (!isClientReady)
-    return res.status(503).json({ error: "WhatsApp not ready" });
+app.post("/api/send-bulk", async (req, res) => {
+  const { contacts, message } = req.body; // contacts: Array of IDs
+  
+  res.json({ success: true, message: "Bulk process started" });
 
-  const { chatId } = req.params;
-  const { content } = req.body;
-
-  try {
-    const sentMsg = await client.sendMessage(chatId, content);
-
-    const messageData = {
-      id: sentMsg.id._serialized,
-      chatId,
-      content,
-      timestamp: new Date().toISOString(),
-      fromMe: true,
-      sender: "You",
-      type: "chat",
-      status: "sent",
-    };
-
-    db.data.messages.push(messageData);
-    await db.write();
-    io.emit("new_message", messageData);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Message send failed:", err);
-    res.status(500).json({ error: err.message });
+  // Process in background so API doesn't hang
+  for (const contact of contacts) {
+    try {
+      await client.sendMessage(contact, message);
+      // Wait 2 seconds between each message to avoid ban/lag
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } catch (err) {
+      console.error(`Failed to send to ${contact}`);
+    }
   }
 });
 
-
-/* ────────────────────────────────
-   ⏰ MESSAGE SCHEDULER (every min)
-──────────────────────────────── */
+/* ── OPTIMIZED SCHEDULER ── */
 cron.schedule("* * * * *", async () => {
   if (!isClientReady) return;
+
   const now = new Date();
+  let hasChanged = false;
 
-  for (const msg of db.data.scheduledMessages || []) {
-    if (!msg.sent && new Date(msg.sendAt) <= now) {
-      try {
-        await client.sendMessage(msg.chatId, msg.content);
-        msg.sent = true;
-        msg.sentAt = new Date().toISOString();
+  // Only process pending messages
+  const pending = db.data.scheduledMessages.filter(m => !m.sent && new Date(m.sendAt) <= now);
 
-        io.emit("new_message", {
-          chatId: msg.chatId,
-          content: `[SCHEDULED] ${msg.content}`,
-          fromMe: true,
-          sender: "You",
-          type: "chat",
-          timestamp: new Date(),
-        });
-      } catch (err) {
-        msg.error = err.message;
-      }
+  for (const msg of pending) {
+    try {
+      await client.sendMessage(msg.chatId, msg.content);
+      msg.sent = true;
+      msg.sentAt = new Date().toISOString();
+      hasChanged = true;
+      
+      // Delay to prevent CPU spikes
+      await new Promise(res => setTimeout(res, 1500));
+    } catch (err) {
+      msg.error = err.message;
     }
   }
 
-  await db.write();
+  if (hasChanged) await db.write(); // Only write if something actually happened
 });
 
-
-/* ────────────────────────────────
-   🚀 SERVER START
-──────────────────────────────── */
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`🌐 Server running on port ${PORT}`);
-  console.log(`📱 WhatsApp Scheduler Backend Ready`);
-});
-
-process.on("SIGINT", async () => {
-  console.log("🛑 Gracefully shutting down...");
-  await client.destroy();
-  process.exit(0);
-});
+server.listen(5000, () => console.log("🌐 Server on 5000"));
